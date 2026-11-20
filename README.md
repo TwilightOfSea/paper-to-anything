@@ -154,3 +154,4 @@ outputs/
 - 程序直接连接 `https://api.siliconflow.cn/v1`；如所在网络必须经过代理，需要后续增加代理设置。
 
 Apache-2.0 原项目来源：`paper2anything`。
+---
