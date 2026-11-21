@@ -12,6 +12,32 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 WECHAT_COVER_SIZE = (900, 383)
 POSTER_SIZE = (2400, 1600)
 XHS_COVER_SIZE = (1080, 1440)
+COVER_STYLE_PALETTES = {
+    "产品主视觉风": {
+        "panel": (18, 42, 37),
+        "accent": (91, 183, 151),
+        "ink": (255, 255, 255),
+        "card": (248, 250, 247),
+    },
+    "对比卡片风": {
+        "panel": (28, 38, 57),
+        "accent": (223, 117, 87),
+        "ink": (255, 255, 255),
+        "card": (248, 246, 241),
+    },
+    "极简留白风": {
+        "panel": (244, 241, 233),
+        "accent": (47, 122, 104),
+        "ink": (27, 43, 38),
+        "card": (255, 255, 255),
+    },
+    "海报拼贴风": {
+        "panel": (39, 31, 53),
+        "accent": (151, 121, 211),
+        "ink": (255, 255, 255),
+        "card": (248, 247, 252),
+    },
+}
 
 POSTER_PALETTES = {
     "自动匹配": {
@@ -123,25 +149,39 @@ def _fit_font(draw, text: str, max_width: int, max_height: int, start: int = 54)
     return font, [text[max(0, len(text) - 18) :]], 26
 
 
-def _draw_cover_title(canvas: Image.Image, title: str) -> Image.Image:
+def _cover_style_palette(style: str) -> dict:
+    return COVER_STYLE_PALETTES.get(style, COVER_STYLE_PALETTES["极简留白风"])
+
+
+def _draw_cover_title(canvas: Image.Image, title: str, style: str) -> Image.Image:
+    palette = _cover_style_palette(style)
+    width, height = canvas.size
+    overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    overlay_draw = ImageDraw.Draw(overlay)
+    panel_width = int(width * 0.54)
+    overlay_draw.rectangle([0, 0, panel_width, height], fill=(*palette["panel"], 255))
+    overlay_draw.rectangle([0, 0, 10, height], fill=(*palette["accent"], 255))
+    canvas = Image.alpha_composite(canvas.convert("RGBA"), overlay).convert("RGB")
+
     draw = ImageDraw.Draw(canvas)
-    font, lines, line_height = _fit_font(draw, title, 500, 180, 48)
-    x, y = 34, 34
+    font, lines, line_height = _fit_font(draw, title, panel_width - 62, height - 72, 36)
+    x = 34
+    y = (height - line_height * len(lines)) // 2
     for line in lines:
-        draw.text(
-            (x, y),
-            line,
-            font=font,
-            fill=(255, 255, 255),
-            stroke_width=2,
-            stroke_fill=(12, 22, 34),
-        )
+        draw.text((x, y), line, font=font, fill=palette["ink"])
         y += line_height
     return canvas
 
 
-def build_cover(title: str, image_bytes: bytes | None, fallback_image: Path | None, out_path: Path) -> str:
+def build_cover(
+    title: str,
+    image_bytes: bytes | None,
+    fallback_image: Path | None,
+    out_path: Path,
+    style: str = "极简留白风",
+) -> str:
     target_w, target_h = WECHAT_COVER_SIZE
+    palette = _cover_style_palette(style)
     if image_bytes:
         from app.siliconflow import bytes_to_image
 
@@ -151,19 +191,19 @@ def build_cover(title: str, image_bytes: bytes | None, fallback_image: Path | No
         left = (resized.width - target_w) // 2
         top = (resized.height - target_h) // 2
         canvas = resized.crop((left, top, left + target_w, top + target_h))
-        canvas = _draw_cover_title(canvas, title)
+        canvas = _draw_cover_title(canvas, title, style)
         canvas.save(out_path, "JPEG", quality=92)
         return "ai_generated"
 
     if fallback_image and fallback_image.exists():
         try:
-            canvas = Image.new("RGB", (target_w, target_h), (24, 42, 58))
+            canvas = Image.new("RGB", (target_w, target_h), palette["panel"])
             draw = ImageDraw.Draw(canvas)
-            draw.rectangle([0, 0, 9, target_h], fill=(72, 170, 190))
+            draw.rectangle([0, 0, 9, target_h], fill=palette["accent"])
             font, lines, line_height = _fit_font(draw, title, 330, target_h - 56, 42)
             y = (target_h - line_height * len(lines)) // 2
             for line in lines:
-                draw.text((30, y), line, font=font, fill=(255, 255, 255))
+                draw.text((30, y), line, font=font, fill=palette["ink"])
                 y += line_height
             source = Image.open(fallback_image).convert("RGB")
             box = (390, 32, target_w - 30, target_h - 32)
@@ -176,13 +216,13 @@ def build_cover(title: str, image_bytes: bytes | None, fallback_image: Path | No
         except Exception:
             pass
 
-    canvas = Image.new("RGB", (target_w, target_h), (20, 35, 50))
+    canvas = Image.new("RGB", (target_w, target_h), palette["panel"])
     draw = ImageDraw.Draw(canvas)
-    draw.rectangle([0, 0, 9, target_h], fill=(72, 170, 190))
+    draw.rectangle([0, 0, 9, target_h], fill=palette["accent"])
     font, lines, line_height = _fit_font(draw, title, target_w - 80, target_h - 70, 48)
     y = (target_h - line_height * len(lines)) // 2
     for line in lines:
-        draw.text((40, y), line, font=font, fill=(255, 255, 255))
+        draw.text((40, y), line, font=font, fill=palette["ink"])
         y += line_height
     canvas.save(out_path, "JPEG", quality=92)
     return "local_text"
@@ -464,34 +504,60 @@ def build_xhs_cover(
     image_path: Path | None,
     out_path: Path,
     image_bytes: bytes | None = None,
+    style: str = "极简留白风",
 ) -> str:
     width, height = XHS_COVER_SIZE
-    navy, cream, accent = (22, 34, 51), (248, 245, 237), (217, 93, 57)
-    canvas = Image.new("RGB", (width, height), navy)
-    draw = ImageDraw.Draw(canvas)
+    palette = _cover_style_palette(style)
     font_path = _font_path()
 
-    draw.rectangle([0, 0, 14, height], fill=accent)
-    draw.text((70, 58), "RESEARCH NOTE", font=ImageFont.truetype(font_path, 24) if font_path else ImageFont.load_default(), fill=(174, 196, 204))
-    title_font, title_lines, title_line_height = _fit_font(draw, title, width - 140, 330, 84)
-    title_y = 120
-    for line in title_lines:
-        draw.text((70, title_y), line, font=title_font, fill=cream)
-        title_y += title_line_height
-    if subtitle:
-        subtitle_font = ImageFont.truetype(font_path, 26) if font_path else ImageFont.load_default()
-        subtitle_lines = _wrap_text(draw, subtitle, subtitle_font, width - 140)
-        subtitle_y = max(420, title_y + 22)
-        for line in subtitle_lines[:2]:
-            draw.text((70, subtitle_y), line, font=subtitle_font, fill=(174, 196, 204))
-            subtitle_y += 34
-
-    source: Image.Image | None = None
     if image_bytes:
         from app.siliconflow import bytes_to_image
 
         source = bytes_to_image(image_bytes).convert("RGB")
-    elif image_path and image_path.is_file():
+        scale = max(width / source.width, height / source.height)
+        resized = source.resize(
+            (max(1, int(source.width * scale)), max(1, int(source.height * scale))),
+            Image.LANCZOS,
+        )
+        left = (resized.width - width) // 2
+        top = (resized.height - height) // 2
+        canvas = resized.crop((left, top, left + width, top + height))
+        overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+        overlay_draw = ImageDraw.Draw(overlay)
+        panel_top = height - 440
+        overlay_draw.rectangle([0, panel_top, width, height], fill=(*palette["panel"], 255))
+        overlay_draw.rectangle([0, panel_top, width, panel_top + 14], fill=(*palette["accent"], 255))
+        canvas = Image.alpha_composite(canvas.convert("RGBA"), overlay).convert("RGB")
+        draw = ImageDraw.Draw(canvas)
+        title_font, title_lines, title_line_height = _fit_font(
+            draw, title, width - 140, 320, 88
+        )
+        title_y = panel_top + (440 - title_line_height * len(title_lines)) // 2
+        for line in title_lines:
+            draw.text((70, title_y), line, font=title_font, fill=palette["ink"])
+            title_y += title_line_height
+        canvas.save(out_path, "PNG")
+        return "ai_generated"
+
+    canvas = Image.new("RGB", (width, height), palette["panel"])
+    draw = ImageDraw.Draw(canvas)
+
+    draw.rectangle([0, 0, 14, height], fill=palette["accent"])
+    title_font, title_lines, title_line_height = _fit_font(draw, title, width - 140, 330, 84)
+    title_y = 90
+    for line in title_lines:
+        draw.text((70, title_y), line, font=title_font, fill=palette["ink"])
+        title_y += title_line_height
+    if subtitle:
+        subtitle_font = ImageFont.truetype(font_path, 26) if font_path else ImageFont.load_default()
+        subtitle_lines = _wrap_text(draw, subtitle, subtitle_font, width - 140)
+        subtitle_y = max(400, title_y + 22)
+        for line in subtitle_lines[:2]:
+            draw.text((70, subtitle_y), line, font=subtitle_font, fill=palette["ink"])
+            subtitle_y += 34
+
+    source: Image.Image | None = None
+    if image_path and image_path.is_file():
         with Image.open(image_path) as raw:
             source = ImageOps.exif_transpose(raw).convert("RGB")
 
@@ -506,7 +572,7 @@ def build_xhs_cover(
         draw.rounded_rectangle(
             [card_left, card_top, card_left + card_width, card_top + card_height],
             radius=24,
-            fill=cream,
+            fill=palette["card"],
             outline=(221, 224, 225),
             width=2,
         )
@@ -515,13 +581,13 @@ def build_xhs_cover(
         return "paper_figure_composed"
 
     panel = (70, 540, width - 70, height - 80)
-    draw.rounded_rectangle(panel, radius=24, fill=(30, 47, 69), outline=(50, 73, 96), width=2)
-    draw.rectangle([panel[0] + 38, panel[1] + 56, panel[0] + 160, panel[1] + 70], fill=accent)
+    draw.rounded_rectangle(panel, radius=24, fill=palette["card"], outline=(210, 214, 216), width=2)
+    draw.rectangle([panel[0] + 38, panel[1] + 56, panel[0] + 160, panel[1] + 70], fill=palette["accent"])
     note_font = ImageFont.truetype(font_path, 38) if font_path else ImageFont.load_default()
     note_lines = _wrap_text(draw, subtitle or title, note_font, panel[2] - panel[0] - 80)
     note_y = panel[1] + 118
     for line in note_lines[:8]:
-        draw.text((panel[0] + 40, note_y), line, font=note_font, fill=cream)
+        draw.text((panel[0] + 40, note_y), line, font=note_font, fill=palette["ink"])
         note_y += 52
     canvas.save(out_path, "PNG")
     return "local_text"

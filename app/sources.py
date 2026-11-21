@@ -17,6 +17,8 @@ SUPPORTED_SUFFIXES = {".pdf", ".txt", ".md", ".markdown", ".html", ".htm"}
 SCANNED_PAGE_MIN_CHARS = 20
 SCANNED_PAGE_RATIO = 0.8
 MAX_REMOTE_IMAGE_BYTES = 25 * 1024 * 1024
+VECTOR_MERGE_GAP = 36.0
+VECTOR_RENDER_SCALE = 2.5
 _REMOTE_SESSION = requests.Session()
 _REMOTE_SESSION.trust_env = False
 
@@ -139,6 +141,87 @@ def _extract_markdown_images(text: str, base_dir: Path, image_dir: Path) -> list
     return found
 
 
+def _extract_pdf_vector_images(
+    page, page_index: int, image_dir: Path, images: list[SourceImage]
+) -> None:
+    import pymupdf
+
+    boxes: list[pymupdf.Rect] = []
+    for drawing in page.get_drawings():
+        raw = drawing.get("rect")
+        if raw is None:
+            continue
+        box = pymupdf.Rect(
+            max(page.rect.x0, raw.x0),
+            max(page.rect.y0, raw.y0),
+            min(page.rect.x1, raw.x1),
+            min(page.rect.y1, raw.y1),
+        )
+        if box.width >= 2 or box.height >= 2:
+            boxes.append(box)
+    if len(boxes) < 8:
+        return
+
+    # shortcut: vector bands may merge adjacent panels; upgrade to caption-based segmentation.
+    boxes.sort(key=lambda box: (box.y0, box.y1))
+    bands: list[list] = []
+    for box in boxes:
+        if bands and box.y0 <= bands[-1][0].y1 + VECTOR_MERGE_GAP:
+            bands[-1][0] |= box
+            bands[-1][1] += 1
+        else:
+            bands.append([box, 1])
+
+    vector_index = 0
+    for band, drawing_count in bands:
+        if drawing_count < 12 or band.width < 120 or band.height < 120:
+            continue
+        crop = pymupdf.Rect(band)
+        crop = (crop + (-6, -6, 6, 6)) & page.rect
+        vector_index += 1
+        dest = image_dir / f"pdf_p{page_index}_vector{vector_index}.png"
+        page.get_pixmap(
+            matrix=pymupdf.Matrix(VECTOR_RENDER_SCALE, VECTOR_RENDER_SCALE),
+            clip=crop,
+            alpha=False,
+        ).save(dest)
+        width, height = _image_size(dest)
+        if width < 240 or height < 160:
+            dest.unlink(missing_ok=True)
+            continue
+        images.append(SourceImage(dest, page=page_index, width=width, height=height))
+
+
+def _pdf_page_text(page) -> str:
+    regular = page.get_text("text") or ""
+    try:
+        # Some PDFs leave body text in the content stream that get_text() drops.
+        lines: list[str] = []
+        line_y: float | None = None
+        parts: list[str] = []
+        for span in sorted(page.get_texttrace(), key=lambda item: item["seqno"]):
+            text = "".join(chr(char[0]) for char in span.get("chars", []))
+            if not text:
+                continue
+            y0 = span["bbox"][1]
+            if line_y is not None and abs(y0 - line_y) > 2.5:
+                line = "".join(parts).strip()
+                if line:
+                    lines.append(line)
+                parts = []
+            line_y = y0
+            parts.append(text)
+        line = "".join(parts).strip()
+        if line:
+            lines.append(line)
+        traced = "\n".join(lines)
+        if _meaningful_chars(traced) > _meaningful_chars(regular):
+            return traced
+    except Exception:
+        pass
+    return regular
+
+
 def _load_pdf(path: Path, image_dir: Path) -> SourceBundle:
     try:
         import pymupdf
@@ -168,7 +251,7 @@ def _load_pdf(path: Path, image_dir: Path) -> SourceBundle:
 
     try:
         for page_index, page in enumerate(doc, 1):
-            text = page.get_text("text") or ""
+            text = _pdf_page_text(page)
             page_texts.append(text)
             for image_index, item in enumerate(page.get_images(full=True), 1):
                 xref = int(item[0])
@@ -190,6 +273,10 @@ def _load_pdf(path: Path, image_dir: Path) -> SourceBundle:
                     images.append(SourceImage(dest, page=page_index, width=width, height=height))
                 except Exception:
                     continue
+            try:
+                _extract_pdf_vector_images(page, page_index, image_dir, images)
+            except Exception:
+                continue
     finally:
         doc.close()
 

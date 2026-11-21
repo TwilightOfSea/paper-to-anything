@@ -136,11 +136,13 @@ class SiliconFlowClient:
             0.1,
         )
 
-    def generate_image(self, prompt: str, model: str) -> bytes:
+    def generate_image(
+        self, prompt: str, model: str, image_size: str = "1024x1024"
+    ) -> bytes:
         payload: dict = {
             "model": model,
             "prompt": prompt,
-            "image_size": "1024x1024",
+            "image_size": image_size,
             "num_inference_steps": 20,
         }
         if model == FREE_IMAGE_MODEL:

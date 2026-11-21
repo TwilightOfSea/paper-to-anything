@@ -33,7 +33,26 @@ from app.sources import SourceBundle, SourceError, SourceImage, load_source
 
 
 LogFn = Callable[[str], None]
-MAX_SOURCE_CHARS = 50000
+MAX_SOURCE_CHARS = 70000
+COVER_STYLES = ["产品主视觉风", "对比卡片风", "极简留白风", "海报拼贴风"]
+COVER_STYLE_PROMPTS = {
+    "产品主视觉风": (
+        "Product-led cover background. A dominant clean floating interface card, soft shadow, "
+        "neutral field, restrained teal accent."
+    ),
+    "对比卡片风": (
+        "Comparison-card cover background. Overlapping cards, a large bright card in front "
+        "and a smaller dark card behind, clear contrast and depth."
+    ),
+    "极简留白风": (
+        "Minimal cover background. Warm white field, mostly negative space, a restrained "
+        "geometric accent and a subtle teal detail."
+    ),
+    "海报拼贴风": (
+        "Poster-collage cover background. Layered paper cards, geometric "
+        "fragments and soft shadows with clear foreground, middle ground and background depth."
+    ),
+}
 
 
 @contextmanager
@@ -66,6 +85,7 @@ class RunOptions:
     wechat_length: int = 1800
     ai_cover: bool = False
     image_model: str = FREE_IMAGE_MODEL
+    cover_style: str = "极简留白风"
     output_language: str = "跟随原文"
     poster_style: str = "自动匹配"
     xhs_tone: str = "专业科普"
@@ -114,13 +134,16 @@ def _unique_dir(parent: Path, stem: str) -> Path:
 def _truncate(text: str, limit: int = MAX_SOURCE_CHARS) -> str:
     if len(text) <= limit:
         return text
-    return text[:limit] + "\n\n[正文已截断：仅使用前 50000 字符供本次生成]"
+    return text[:limit] + f"\n\n[正文已截断：仅使用前 {limit} 字符供本次生成]"
 
 
 def _copy_pipeline_images(bundle: SourceBundle, out_dir: Path, max_images: int) -> list[dict]:
     if not bundle.images:
         return []
-    selected: list[SourceImage] = sorted(bundle.images, key=lambda item: item.area, reverse=True)[:max_images]
+    # Stable source-page order keeps figure_01 aligned with the first figure in the paper.
+    selected: list[SourceImage] = sorted(
+        bundle.images, key=lambda item: item.page if item.page is not None else float("inf")
+    )[:max_images]
     image_dir = out_dir / "images"
     image_dir.mkdir(parents=True, exist_ok=True)
     copied: list[dict] = []
@@ -189,22 +212,79 @@ def _image_manifest(copied: list[dict]) -> str:
     )
 
 
+def _cover_image_prompt(style: str, orientation: str) -> str:
+    base = COVER_STYLE_PROMPTS.get(style, COVER_STYLE_PROMPTS["极简留白风"])
+    return (
+        f"{base} {orientation} No people, faces, portraits or body parts. "
+        "No text, letters, numbers, charts, logos or watermarks."
+    )
+
+
 def _write_job_info(out_dir: Path, task: str, options: RunOptions) -> None:
     data = {"task": task, "options": asdict(options)}
     (out_dir / "job.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _resolve_local_image(src: str, out_dir: Path) -> str:
+    if not src.startswith("images/"):
+        return src
+    requested = Path(src)
+    if requested.is_absolute() or ".." in requested.parts:
+        return ""
+    actual = out_dir / requested
+    if actual.is_file():
+        return src
+    image_dir = out_dir / "images"
+    if image_dir.is_dir():
+        for candidate in image_dir.iterdir():
+            if candidate.is_file() and candidate.stem == requested.stem:
+                return f"images/{candidate.name}"
+    return ""
+
+
+def _repair_markdown_images(markdown: str, out_dir: Path, log: LogFn) -> str:
+    repaired = 0
+    removed = 0
+
+    def replace(match: re.Match) -> str:
+        nonlocal repaired, removed
+        alt, src = match.group(1), match.group(2)
+        resolved = _resolve_local_image(src, out_dir)
+        if resolved == src:
+            return match.group(0)
+        if resolved:
+            repaired += 1
+            return f"![{alt}]({resolved})"
+        removed += 1
+        return ""
+
+    result = re.sub(r"!\[([^\]]*)\]\((images/[^)\s]+)\)", replace, markdown)
+    if repaired:
+        log(f"已修正 {repaired} 个 Markdown 图片路径")
+    if removed:
+        log(f"已移除 {removed} 个引用不存在的 Markdown 图片")
+    return result
+
+
 def _clean_html_images(html: str, out_dir: Path, log: LogFn) -> str:
     soup = BeautifulSoup(html, "html.parser")
+    repaired = 0
     removed = 0
     for tag in soup.find_all("img"):
         src = (tag.get("src") or "").strip()
         if src.startswith("images/"):
-            if not (out_dir / src).is_file():
+            resolved = _resolve_local_image(src, out_dir)
+            if not resolved:
                 tag.decompose()
                 removed += 1
+                continue
+            if resolved != src:
+                tag["src"] = resolved
+                repaired += 1
         if tag.get("src") and not (tag.get("alt") or "").strip():
             tag["alt"] = "论文配图"
+    if repaired:
+        log(f"已修正 {repaired} 个 HTML 图片路径")
     if removed:
         log(f"已移除 {removed} 个引用不存在的图片")
     return str(soup)
@@ -293,8 +373,12 @@ def _generate_html(
 论文正文：
 {_truncate(bundle.text)}
 """
-    log("正在调用文本模型生成项目主页")
-    raw = client.chat(system, user, max_tokens=12000)
+    with _waiting_progress(
+        log,
+        "正在调用文本模型生成项目主页",
+        "模型仍在生成项目主页",
+    ):
+        raw = client.chat(system, user, max_tokens=12000)
     (out_dir / "raw_model_output.txt").write_text(raw, encoding="utf-8")
     html = _normalize_html_output(raw)
     lower = html.lower()
@@ -330,8 +414,9 @@ def _wechat_prompt(bundle: SourceBundle, options: RunOptions, copied: list[dict]
 1. 用 H2 分节，讲清问题、方法、关键结果、意义与局限。
 2. 可解释直觉和背景，但必须区分论文事实与作者点评。
 3. body_markdown 中只引用给定图片清单里的相对路径；没有图片就不要编造图片。
-4. 标题有吸引力但不要标题党，摘要准确。
-5. JSON 字符串必须正确转义。
+4. 图片路径必须与清单中的文件名和后缀完全一致，不要假设都是 .jpg/.jpeg/.png。
+5. 标题有吸引力但不要标题党，摘要准确。
+6. JSON 字符串必须正确转义。
 
 论文原文：
 {_truncate(bundle.text)}
@@ -349,8 +434,12 @@ def _generate_wechat(
 ) -> None:
     copied = _copy_pipeline_images(bundle, out_dir, 4) if options.include_images else []
     system, user = _wechat_prompt(bundle, options, copied)
-    log("正在调用文本模型生成公众号文章")
-    raw = strip_code_fence(client.chat(system, user, max_tokens=10000))
+    with _waiting_progress(
+        log,
+        "正在调用文本模型生成公众号文章",
+        "模型仍在生成公众号文章",
+    ):
+        raw = strip_code_fence(client.chat(system, user, max_tokens=10000))
     try:
         article = _extract_json_object(raw)
     except Exception as exc:
@@ -362,6 +451,7 @@ def _generate_wechat(
     body = str(article.get("body_markdown") or "").strip()
     if len(body) < 200:
         raise SiliconFlowError("模型返回的公众号正文过短")
+    body = _repair_markdown_images(body, out_dir, log)
 
     if copied and not any(item["relative"] in body for item in copied):
         body += "\n\n## 论文配图\n\n"
@@ -387,23 +477,27 @@ def _generate_wechat(
     generated: bytes | None = None
     if options.ai_cover:
         gate.wait(log)
-        log(f"正在使用 {options.image_model} 生成公众号封面")
-        prompt = (
-            f"为学术论文公众号文章设计一张专业、简洁的横版封面。主题：{cover_title}。"
-            f"文章摘要：{digest[:300]}。不要画具体数据图、坐标轴、表格或虚构界面，"
-            "不要出现真实人物照片。画面不要出现任何文字、字母、数字、标志或水印，"
-            "构图留出清晰标题区域，视觉风格克制、现代。"
-        )
-        try:
-            generated = client.generate_image(prompt, options.image_model)
-        except Exception as exc:
-            image_error = str(exc)
-            log(f"生图失败，回退本地封面：{image_error[:200]}")
+        prompt = _cover_image_prompt(options.cover_style, "Wide landscape composition.")
+        with _waiting_progress(
+            log,
+            f"正在使用 {options.image_model} 生成公众号封面",
+            "生图模型仍在生成公众号封面",
+        ):
+            try:
+                generated = client.generate_image(
+                    prompt, options.image_model, image_size="1024x576"
+                )
+            except Exception as exc:
+                image_error = str(exc)
+                log(f"生图失败，回退本地封面：{image_error[:200]}")
 
     fallback = Path(copied[0]["relative"]).name if copied else None
     fallback_path = out_dir / "images" / fallback if fallback else None
-    cover_source = build_cover(cover_title, generated, fallback_path, out_dir / "cover.jpg")
+    cover_source = build_cover(
+        cover_title, generated, fallback_path, out_dir / "cover.jpg", options.cover_style
+    )
     metadata["cover_source"] = cover_source
+    metadata["cover_style"] = options.cover_style
     if image_error:
         metadata["image_error"] = image_error[:500]
     (out_dir / "wechat_article.json").write_text(
@@ -426,6 +520,8 @@ def _generate_poster(
         "JSON 字段必须为：title、subtitle、authors、sections、takeaway。"
         "sections 是 6 个对象的数组，每个对象字段为 heading、bullets、figure_index。"
         "bullets 为 2-3 条短句；figure_index 只能取图片清单中的序号，没有合适图片时填 null。"
+        "图片清单按论文从上到下编号，可结合正文中的 Figure 编号判断对应关系。"
+        "图片清单非空时，至少为一个最相关分区选择图片序号。"
     )
     user = f"""论文标题候选：{bundle.title or '未提供'}
 海报视觉风格：{options.poster_style}
@@ -444,8 +540,12 @@ def _generate_poster(
 论文原文：
 {_truncate(bundle.text)}
 """
-    log("正在调用文本模型提炼海报内容")
-    raw = strip_code_fence(client.chat(system, user, max_tokens=6500))
+    with _waiting_progress(
+        log,
+        "正在调用文本模型提炼海报内容",
+        "模型仍在提炼海报内容",
+    ):
+        raw = strip_code_fence(client.chat(system, user, max_tokens=6500))
     (out_dir / "poster_raw_model.txt").write_text(raw, encoding="utf-8")
     try:
         data = _extract_json_object(raw)
@@ -469,6 +569,8 @@ def _generate_poster(
         )
     if len(sections) < 4:
         raise SiliconFlowError("模型返回的海报分区不足，无法形成完整海报")
+    if copied and not any(section["figure"] for section in sections):
+        sections[min(3, len(sections) - 1)]["figure"] = 1
 
     spec = {
         "title": str(data.get("title") or bundle.title or bundle.source_path.stem).strip(),
@@ -522,8 +624,12 @@ def _generate_xhs(
 论文原文：
 {_truncate(bundle.text)}
 """
-    log("正在调用文本模型生成小红书文案")
-    raw = strip_code_fence(client.chat(system, user, max_tokens=4500))
+    with _waiting_progress(
+        log,
+        "正在调用文本模型生成小红书文案",
+        "模型仍在生成小红书文案",
+    ):
+        raw = strip_code_fence(client.chat(system, user, max_tokens=4500))
     (out_dir / "xhs_raw_model.txt").write_text(raw, encoding="utf-8")
     try:
         data = _extract_json_object(raw)
@@ -549,18 +655,19 @@ def _generate_xhs(
     generated: bytes | None = None
     if options.ai_cover:
         gate.wait(log)
-        log(f"正在使用 {options.image_model} 生成小红书封面")
-        prompt = (
-            f"为学术论文小红书笔记设计一张克制、清晰的竖版主视觉。主题：{cover_text}。"
-            f"论文一句话背景：{str(data.get('title') or '')}。"
-            "不要画具体数据图、坐标轴、表格或虚构界面，不要出现真实人物照片；"
-            "画面不要出现文字、字母、数字、标志或水印，主体居中，适合竖版裁切。"
-        )
-        try:
-            generated = client.generate_image(prompt, options.image_model)
-        except Exception as exc:
-            image_error = str(exc)
-            log(f"生图失败，回退论文配图封面：{image_error[:200]}")
+        prompt = _cover_image_prompt(options.cover_style, "Vertical 3:4 composition.")
+        with _waiting_progress(
+            log,
+            f"正在使用 {options.image_model} 生成小红书封面",
+            "生图模型仍在生成小红书封面",
+        ):
+            try:
+                generated = client.generate_image(
+                    prompt, options.image_model, image_size="768x1024"
+                )
+            except Exception as exc:
+                image_error = str(exc)
+                log(f"生图失败，回退论文配图封面：{image_error[:200]}")
 
     cover_source = build_xhs_cover(
         cover_text,
@@ -568,6 +675,7 @@ def _generate_xhs(
         cover_image,
         out_dir / "cover.png",
         generated,
+        options.cover_style,
     )
     post_dir = out_dir / "post_images"
     post_dir.mkdir(parents=True, exist_ok=True)
@@ -586,6 +694,7 @@ def _generate_xhs(
         "cover_text": cover_text,
         "hashtags": hashtags,
         "cover_source": cover_source,
+        "cover_style": options.cover_style,
         "post_images": post_images,
         "word_count": len(re.sub(r"\s+", "", body)),
     }

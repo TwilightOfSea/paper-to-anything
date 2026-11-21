@@ -11,7 +11,7 @@ from ctypes import wintypes
 from pathlib import Path
 
 from PyQt5.QtCore import QSize, Qt, QUrl, pyqtSignal
-from PyQt5.QtGui import QDesktopServices, QFont, QFontDatabase, QTextCursor
+from PyQt5.QtGui import QDesktopServices, QFont, QFontDatabase, QIcon, QTextCursor
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -38,7 +38,7 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from app.pipelines import ImageGenerationGate, RunOptions, run_task
+from app.pipelines import COVER_STYLES, ImageGenerationGate, RunOptions, run_task
 from app.siliconflow import FREE_IMAGE_MODEL, IMAGE_MODELS, SiliconFlowClient, SiliconFlowError
 
 
@@ -55,6 +55,7 @@ FONT_PATHS = (
     RESOURCE_DIR / "assets" / "HarmonyOS_Sans_SC_Medium.ttf",
     RESOURCE_DIR / "assets" / "HarmonyOS_Sans_SC_Bold.ttf",
 )
+ICON_PATH = RESOURCE_DIR / "assets" / "app_icon.ico"
 LANGUAGES = ["跟随原文", "中文", "English"]
 CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / "PaperToAnything"
 SETTINGS_FILE = CONFIG_DIR / "settings.json"
@@ -536,6 +537,7 @@ def _run_cli(args: argparse.Namespace) -> int:
             wechat_length=args.wechat_length,
             ai_cover=args.ai_cover,
             image_model=args.image_model,
+            cover_style=args.cover_style,
             output_language=args.output_language,
             poster_style=args.poster_style,
             xhs_tone=args.xhs_tone,
@@ -1033,8 +1035,7 @@ class App(QMainWindow):
         self.wechat_images = QCheckBox("使用论文配图")
         self.wechat_images.setChecked(True)
         grid.addWidget(self.wechat_images, 1, 0, 1, 2)
-        self.ai_cover, self.image_model = self._ai_cover_row()
-        grid.addWidget(self.ai_cover, 2, 0, 1, 3)
+        # AI cover controls are hidden in the GUI for now; CLI options remain available.
         self.task_pages["wechat"] = page
         self.option_stack.addWidget(page)
 
@@ -1059,8 +1060,7 @@ class App(QMainWindow):
         self.xhs_images = QCheckBox("使用论文配图")
         self.xhs_images.setChecked(True)
         grid.addWidget(self.xhs_images, 1, 0, 1, 2)
-        self.xhs_ai_cover, self.xhs_image_model = self._ai_cover_row()
-        grid.addWidget(self.xhs_ai_cover, 2, 0, 1, 3)
+        # AI cover controls are hidden in the GUI for now; CLI options remain available.
         self.task_pages["xhs"] = page
         self.option_stack.addWidget(page)
 
@@ -1085,7 +1085,7 @@ class App(QMainWindow):
         self.task_pages["slides"] = page
         self.option_stack.addWidget(page)
 
-    def _ai_cover_row(self) -> tuple[QWidget, QComboBox]:
+    def _ai_cover_row(self) -> tuple[QWidget, QCheckBox, QComboBox]:
         row = QWidget()
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -1099,7 +1099,7 @@ class App(QMainWindow):
         model.setEnabled(False)
         cover.toggled.connect(lambda checked: self._toggle_image_model(checked, model))
         layout.addWidget(model, 1)
-        return row, model
+        return row, cover, model
 
     def _build_run_card(self) -> QFrame:
         card, layout = self._card()
@@ -1342,8 +1342,6 @@ class App(QMainWindow):
                 include_images=self.wechat_images.isChecked(),
                 wechat_angle=self.wechat_angle.currentText(),
                 wechat_length=int(self.wechat_length.currentText()),
-                ai_cover=self.ai_cover.isChecked(),
-                image_model=self.image_model.currentText(),
             )
         elif task == "poster":
             options = RunOptions(
@@ -1356,8 +1354,6 @@ class App(QMainWindow):
                 include_images=self.xhs_images.isChecked(),
                 output_language=self.xhs_language.currentText(),
                 xhs_tone=self.xhs_tone.currentText(),
-                ai_cover=self.xhs_ai_cover.isChecked(),
-                image_model=self.xhs_image_model.currentText(),
             )
         else:
             options = RunOptions(
@@ -1439,6 +1435,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-visual-qa", action="store_true", help="跳过幻灯片 AI 视觉审查")
     parser.add_argument("--ai-cover", action="store_true", help="使用硅基流动模型生成公众号或小红书封面")
     parser.add_argument("--image-model", default=FREE_IMAGE_MODEL, choices=IMAGE_MODELS)
+    parser.add_argument("--cover-style", choices=COVER_STYLES, default="极简留白风")
     return parser
 
 
@@ -1460,6 +1457,7 @@ def main() -> int:
         )
     app = QApplication([sys.argv[0]])
     app.setApplicationName("Paper to Anything")
+    app.setWindowIcon(QIcon(str(ICON_PATH)))
     app.setStyle("Fusion")
     window = App()
     window.show()
